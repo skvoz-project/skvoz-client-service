@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+# Standard Docker target build; local resource checks belong to build-local.
+require 'optparse'
+options = { tag: 'skvoz-client:local' }
+OptionParser.new do |parser|
+  parser.banner = 'Usage: ruby bin/build-image --target tests|deploy [--tag-prefix TAG]'
+  parser.on('--target TARGET', %w[tests deploy]) { |value| options[:target] = value }
+  parser.on('--tag-prefix TAG') { |value| options[:tag] = value }
+end.parse!
+abort 'One owning target is required' unless options[:target] && ARGV.empty?
+root = File.expand_path('..', __dir__)
+exec 'docker', 'build', '--target', options[:target], '--tag', "#{options[:tag]}-#{options[:target]}", root

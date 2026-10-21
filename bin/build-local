@@ -1,0 +1,208 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require 'fileutils'
+require 'json'
+require 'optparse'
+require 'securerandom'
+require 'tmpdir'
+
+image = 'moby/buildkit@sha256:a82d1ab899cda51aade6fe818d71e4b58c4079e047a0cf29dbb93b2b0465ea69'
+options = { deadline: 1800, tag: 'skvoz-client:local' }
+OptionParser.new do |parser|
+  parser.banner = 'Usage: ruby bin/build-local --target tests|deploy [--io-device DEVICE] [--tag-prefix TAG]'
+  parser.on('--target TARGET', %w[tests deploy]) { |value| options[:target] = value }
+  parser.on('--io-device DEVICE') { |value| options[:device] = value }
+  parser.on('--tag-prefix TAG') { |value| options[:tag] = value }
+  parser.on('--deadline SECONDS', Integer) { |value| options[:deadline] = value }
+  parser.on('--budget') { options[:budget] = true }
+end.parse!
+abort 'Build deadline must be1..1800 seconds' unless options[:deadline].between?(1, 1800)
+cpus = lambda do |value|
+  value.split(',').flat_map { |part| first, last = part.split('-').map { |number| Integer(number) }; last ? (first..last).to_a : [first] }
+end
+root = '/sys/fs/cgroup'
+mounts = File.readlines('/proc/self/mountinfo').select { |line| line.split[4] == root && line.include?(' - cgroup2 ') }
+abort 'Complete host cgroup2 hierarchy is required' unless mounts.size == 1 && mounts.first.split[3] == '/' &&
+  !File.exist?(root + '/cpu.max') && !File.exist?(root + '/memory.max')
+affinity = cpus.call(File.read('/proc/self/status')[/^Cpus_allowed_list:\s*(.+)$/, 1])
+memory = File.read('/proc/meminfo')[/^MemAvailable:\s+(\d+)/, 1].to_i * 1024
+capacity = affinity.size
+ancestors = lambda do |relative, &visit|
+  current = File.realpath(root + relative)
+  loop do
+    raise 'Cgroup escaped host hierarchy' unless current == root || current.start_with?(root + '/')
+    visit.call(current)
+    break if current == root
+    current = File.dirname(current)
+  end
+end
+membership = File.read('/proc/self/cgroup').lines.grep(/^0::/)
+abort 'Unambiguous host membership is required' unless membership.size == 1
+ancestors.call(membership.first.delete_prefix('0::').strip) do |path|
+  if File.file?(path + '/cpu.max')
+    quota, period = File.read(path + '/cpu.max').split
+    capacity = [capacity, Integer(quota) / Integer(period)].min unless quota == 'max'
+  end
+  if File.file?(path + '/memory.max') && File.read(path + '/memory.max').strip != 'max'
+    memory = [memory, File.read(path + '/memory.max').to_i - File.read(path + '/memory.current').to_i].min
+  end
+end
+quota = [capacity / 2, 4].min
+memory = [memory / 2, 3 * 1024**3].min / 4096 * 4096
+abort 'Insufficient host CPU or memory' unless quota.positive? && memory >= 256 * 1024**2
+affinity = affinity.take(quota)
+if options[:budget]
+  puts [quota, memory, affinity.join(',')].join(' ')
+  exit
+end
+abort 'One owning target is required' unless options[:target]
+abort 'Local builds require --io-device' unless options[:device]
+device = File.stat(options[:device]) if options[:device]
+abort 'I/O device must be a block device' if device && !device.blockdev?
+work = Dir.mktmpdir('skvoz-client-build-')
+name = 'skvoz-client-build-' + SecureRandom.hex(6)
+started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+deadline = started + options[:deadline]
+final_deadline = deadline + 60
+sequence = 0
+run = lambda do |*argv, until_time: deadline, monitor: nil, expect: 0|
+  sequence += 1
+  log = File.join(work, "command#{sequence}.log")
+  pid = Process.spawn(*argv, out: log, err: [:child, :out], pgroup: true)
+  loop do
+    waited, status = Process.waitpid2(pid, Process::WNOHANG)
+    if waited
+      pid = nil
+      raise "Command failed: #{argv.first}: #{File.binread(log)[-4000, 4000] || File.binread(log)}" unless status.exitstatus == expect
+      break
+    end
+    raise 'Build deadline exceeded' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= until_time
+    monitor&.call
+    sleep 0.5
+  end
+  File.binread(log, 65_536).to_s
+ensure
+  if pid
+    Process.kill('KILL', -pid) rescue Errno::ESRCH
+    Process.waitpid(pid) rescue Errno::ECHILD
+  end
+end
+expected = { 'cpu.max' => "#{quota * 100000} 100000", 'memory.max' => memory.to_s,
+  'memory.swap.max' => '0', 'pids.max' => '256' }
+expected['io.max'] = "#{device.rdev_major}:#{device.rdev_minor} rbps=8388608 wbps=2097152 riops=max wiops=max" if device
+container = scope = host_pid = host_start = leaf = nil
+created = false
+check = lambda do
+  inspected = JSON.parse(run.call('docker', 'inspect', name)).first
+  raise 'Builder identity changed' if container && inspected.fetch('Id') != container
+  container = inspected.fetch('Id')
+  pid = inspected.fetch('State').fetch('Pid')
+  start = File.read("/proc/#{pid}/stat").split(') ', 2).last.split[19]
+  host_pid ||= pid; host_start ||= start
+  raise 'Builder host process identity changed' unless pid == host_pid && start == host_start
+  leaf = File.read("/proc/#{pid}/cgroup").split('0::').last.strip
+  parts = leaf.split('/')
+  anchors = parts.each_index.select { |index| [container, 'docker-' + container + '.scope'].include?(parts[index]) }
+  raise 'Unique capped Docker ancestor is required' unless anchors.size == 1
+  anchor = parts.take(anchors.first + 1).join('/')
+  raise 'Builder escaped its capped ancestor' unless leaf == anchor || leaf.start_with?(anchor + '/')
+  scope ||= anchor
+  raise 'Builder capped ancestor changed' unless scope == anchor
+  path = root + scope
+  raise 'Builder caps differ' unless expected.all? { |key, value| File.read(path + '/' + key).strip == value }
+  raise 'Builder CPU affinity differs' unless cpus.call(File.read(path + '/cpuset.cpus.effective').strip) == affinity
+  events = File.readlines(path + '/memory.events').to_h { |line| line.split }
+  raise 'Builder OOM or swap' unless events.values_at('oom', 'oom_kill') == %w[0 0] && File.read(path + '/memory.swap.current').to_i.zero?
+  owned_memory = File.read(path + '/memory.current').to_i
+  owned_stats = File.readlines(path + '/memory.stat').to_h { |line| key, value = line.split; [key, value.to_i] }
+  owned_resident = %w[anon kernel_stack pagetables sock percpu slab_unreclaimable].sum { |key| owned_stats.fetch(key, 0) }
+  ancestors.call(scope) do |parent|
+    next if parent == path
+    if File.file?(parent + '/cpuset.cpus.effective')
+      available = cpus.call(File.read(parent + '/cpuset.cpus.effective').strip)
+      raise 'Builder ancestor CPU capacity too small' unless (affinity - available).empty? && available.size >= quota * 2
+    end
+    if File.file?(parent + '/cpu.max')
+      maximum, period = File.read(parent + '/cpu.max').split
+      raise 'Builder ancestor CPU quota too small' unless maximum == 'max' || Integer(maximum) >= 2 * quota * Integer(period)
+    end
+    maximum = File.file?(parent + '/memory.max') ? File.read(parent + '/memory.max').strip : 'max'
+    free = maximum == 'max' ? File.read('/proc/meminfo')[/^MemAvailable:\s+(\d+)/, 1].to_i * 1024 : Integer(maximum) - File.read(parent + '/memory.current').to_i
+    # Numeric ancestors charge all owned pages; MemAvailable already includes reclaimable cache.
+    headroom = free + (maximum == 'max' ? owned_resident : owned_memory)
+    raise 'Builder ancestor remaining memory too small' if headroom < 2 * memory
+  end
+end
+handlers = %w[TERM INT HUP].to_h { |signal| [signal, Signal.trap(signal) { raise Interrupt, 'Build interrupted' }] }
+begin
+  FileUtils.mkdir_p([work + '/probe', work + '/output'])
+  File.write(work + '/buildkitd.toml', "[worker.oci]\n  max-parallelism = 1\n[worker.containerd]\n  enabled = false\n")
+  created = true
+  run.call('docker', 'run', '-d', '--name', name, '--privileged', '--cgroupns', 'private',
+    '--cpus', quota.to_s, '--cpuset-cpus', affinity.join(','), '--memory', memory.to_s, '--memory-swap', memory.to_s,
+    '--pids-limit', '256', '--ulimit', 'core=0', '--ulimit', 'nofile=8192:8192',
+    *(device ? ['--device-read-bps', options[:device] + ':8mb', '--device-write-bps', options[:device] + ':2mb'] : []),
+    '--mount', "type=bind,src=#{File.expand_path('..', __dir__)},dst=/context,readonly",
+    '--mount', "type=bind,src=#{work}/probe,dst=/probe,readonly",
+    '--mount', "type=bind,src=#{work}/output,dst=/output",
+    '--mount', "type=bind,src=#{work}/buildkitd.toml,dst=/etc/buildkit/buildkitd.toml,readonly",
+    '--mount', "type=volume,src=#{name},dst=/var/lib/buildkit", image, '--config', '/etc/buildkit/buildkitd.toml')
+  check.call
+  run.call('docker', 'cp', '-L', name + ':/bin/busybox', work + '/probe/busybox')
+  run.call('docker', 'cp', '-L', name + ':/lib/ld-musl-x86_64.so.1', work + '/probe/ld-musl-x86_64.so.1')
+  File.write(work + '/probe/Dockerfile', "FROM scratch\nCOPY busybox /bin/busybox\nCOPY ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1\nRUN [\"/bin/busybox\",\"sleep\",\"8\"]\n")
+  observed = false
+  run.call('docker', 'exec', name, 'buildctl', '--wait', 'build', '--frontend=dockerfile.v0', '--local', 'context=/probe', '--local', 'dockerfile=/probe', '--no-cache', monitor: lambda {
+    check.call
+    run.call('docker', 'top', name, '-eo', 'pid,args').lines.each do |line|
+      next unless line.split.drop(1).join(' ') == '/bin/busybox sleep 8'
+      group = File.read('/proc/' + line.split.first + '/cgroup').split('0::').last.strip
+      raise 'RUN escaped capped builder' unless group == scope || group.start_with?(scope + '/')
+      observed = true
+    end
+  })
+  raise 'Live RUN ancestry was not observed' unless observed
+  tag = options[:tag] + '-' + options[:target]
+  run.call('docker', 'exec', name, 'buildctl', 'build', '--frontend=dockerfile.v0', '--local', 'context=/context', '--local', 'dockerfile=/context',
+    '--opt', 'target=' + options[:target], '--output', "type=docker,name=#{tag},dest=/output/image.tar", monitor: check)
+  run.call('docker', 'load', '--input', work + '/output/image.tar', monitor: check)
+  result = { image: run.call('docker', 'image', 'inspect', '--format', '{{.Id}}', tag).strip, tag: tag, caps: expected, live_run_ancestry: true, builder: { name: name, id: container, host_pid: host_pid, host_start: host_start, leaf: leaf, scope: scope, volume: name } }
+ensure
+  %w[TERM INT HUP].each { |signal| Signal.trap(signal, 'IGNORE') }
+  failure = $!
+  cleanup_proven = false
+  if created
+    identity = container || name
+    stop_error = nil
+    begin
+      run.call('docker', 'stop', '--timeout', '10', identity, until_time: [Process.clock_gettime(Process::CLOCK_MONOTONIC) + 20, final_deadline].min)
+    rescue StandardError => error
+      failure ||= error
+      stop_error = error
+    end
+    begin
+      run.call('docker', 'rm', *(stop_error ? ['-f'] : []), identity, until_time: [Process.clock_gettime(Process::CLOCK_MONOTONIC) + 20, final_deadline].min)
+      [name, container].compact.each do |identity|
+        absence = run.call('docker', 'container', 'inspect', '--format', '{{.Id}}', identity, until_time: final_deadline, expect: 1)
+        raise 'Builder cleanup identity remains' unless absence.strip == 'Error response from daemon: No such container: ' + identity
+      end
+      raise 'Owned cache still has users' unless run.call('docker', 'ps', '-a', '-q', '--filter', 'volume=' + name, until_time: final_deadline).strip.empty?
+      run.call('docker', 'volume', 'rm', name, until_time: final_deadline)
+      absence = run.call('docker', 'volume', 'inspect', '--format', '{{.Name}}', name, until_time: final_deadline, expect: 1)
+      raise 'Builder volume remains' unless absence.include?('no such volume')
+      raise 'Builder cgroup remains' if scope && File.exist?(root + scope)
+      raise 'Builder host process remains' if host_pid && File.file?("/proc/#{host_pid}/stat") && File.read("/proc/#{host_pid}/stat").split(') ', 2).last.split[19] == host_start
+      cleanup_proven = true
+    rescue StandardError => error
+      failure ||= error
+    end
+  end
+  begin
+    FileUtils.remove_entry_secure(work) if cleanup_proven
+  rescue StandardError => error
+    failure ||= error
+  end
+  handlers.each { |signal, handler| Signal.trap(signal, handler) }
+  raise failure if failure
+end
+puts JSON.generate(result)

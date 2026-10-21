@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __dir__)
+require 'bundler/setup'
+abort 'Usage: install-native LOCK DESTINATION [LOCAL_ARCHIVE]' unless ARGV.size.between?(2, 3)
+begin
+  require_relative '../lib/skvoz/client/native_artifact'
+  Skvoz::NativeArtifact.install(ARGV[0], ARGV[1], archive: ARGV[2])
+rescue LoadError, StandardError => error
+  warn "Native artifact install failed: #{error.class}: #{error.message}"
+  exit 1
+end

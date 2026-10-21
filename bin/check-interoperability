@@ -1,0 +1,221 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __dir__)
+require 'bundler/setup'
+require 'digest'
+require 'json'
+require 'open3'
+require 'optparse'
+require 'securerandom'
+require 'socket'
+require 'timeout'
+
+options = { deadline: 300 }
+OptionParser.new do |parser|
+  parser.banner = 'Usage: bundle exec ruby bin/check-interoperability --server-release TAG --archive PATH --archive-sha256 SHA --receipt PATH --receipt-sha256 SHA --client-image sha256:ID --network-archive PATH --io-device DEVICE'
+  %w[server-release archive archive-sha256 receipt receipt-sha256 client-image network-archive io-device].each do |name|
+    parser.on('--' + name + ' VALUE') { |value| options[name] = value }
+  end
+  parser.on('--deadline SECONDS', Integer) { |value| options[:deadline] = value }
+end.parse!
+required = %w[server-release archive archive-sha256 receipt receipt-sha256 client-image network-archive io-device]
+abort 'All pinned artifact options are required' unless required.all? { |key| options[key] }
+abort 'Deadline must be240..600 seconds' unless options[:deadline].between?(240, 600)
+tag = options.fetch('server-release')
+abort 'An exact Server product release is required' unless tag.match?(/\Aserver-v8\.0\.1-[0-9a-f]{40}\z/)
+%w[archive receipt].each do |kind|
+  path = options.fetch(kind)
+  sha = options.fetch(kind + '-sha256')
+  stat = File.lstat(path)
+  abort 'Invalid pinned Server artifact' unless stat.file? && stat.size.positive? && stat.size <= (kind == 'receipt' ? 65_536 : 1024**3) &&
+    sha.match?(/\A[0-9a-f]{64}\z/) && Digest::SHA256.file(path).hexdigest == sha
+end
+receipt = JSON.parse(File.binread(options.fetch('receipt')), max_nesting: 8, allow_duplicate_key: false)
+expected = { 'schema' => 1, 'component' => 'skvoz-server', 'version' => '8.0.1', 'target' => 'x86_64-unknown-linux-gnu',
+  'source' => { 'repository' => 'https://github.com/skvoz-project/skvoz-server', 'revision' => tag.split('-').last }, 'tag' => tag }
+abort 'Server product receipt differs' unless receipt.keys.sort == (expected.keys + ['image_id']).sort && expected.all? { |key, value| receipt[key] == value }
+server_image = receipt.fetch('image_id')
+client_image = options.fetch('client-image')
+abort 'Exact image IDs are required' unless [server_image, client_image].all? { |id| id.match?(/\Asha256:[0-9a-f]{64}\z/) }
+network_archive = File.expand_path(options.fetch('network-archive'))
+network_lock = File.expand_path('../artifacts/network.lock.json', __dir__)
+abort 'Network archive digest differs from the owning pin' unless File.lstat(network_archive).file? && File.size(network_archive).between?(1, 256 * 1024**2) &&
+  Digest::SHA256.file(network_archive).hexdigest == JSON.parse(File.binread(network_lock)).dig('artifact', 'sha256')
+started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+work_deadline = started + options[:deadline]
+final_deadline = work_deadline + 60
+active = {}
+owned = {}
+run = lambda do |*argv, input: '', deadline: work_deadline, expect: 0, watch: nil, timeout: 30|
+  result = nil
+  Open3.popen3(*argv, pgroup: true) do |stdin, stdout, stderr, process|
+    readers = [stdout, stderr].map { |io| Thread.new { io.read(65_537).to_s } }
+    begin
+      Timeout.timeout([timeout, deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)].min) do
+        if input.respond_to?(:read)
+          sent = 0
+          while (bytes = input.read(65_536))
+            sent += bytes.bytesize
+            raise 'Artifact input exceeded limit' if sent > 256 * 1024**2
+            stdin.write(bytes)
+          end
+        else
+          raise 'Metadata input exceeded limit' if input.bytesize > 65_536
+          stdin.write(input)
+        end
+        stdin.close
+        while process.alive? || readers.any?(&:alive?)
+          watch&.call
+          sleep 0.2
+        end
+        out, error = readers.map(&:value)
+        raise 'Command output exceeded limit' if [out, error].any? { |bytes| bytes.bytesize > 65_536 }
+        result = [out, process.value.exitstatus, error]
+        raise 'Interoperability command failed' if expect && result.fetch(1) != expect
+      end
+    ensure
+      if process.alive?
+        Process.kill('KILL', -process.pid) rescue Errno::ESRCH
+        raise 'Interoperability command was not reaped' unless process.join(2)
+      end
+      readers.each { |reader| reader.kill if reader.alive? }
+    end
+  end
+  result
+end
+quota, memory, affinity = run.call(RbConfig.ruby, File.expand_path('build-local', __dir__), '--budget').first.split
+quota = Integer(quota); memory = Integer(memory)
+abort 'Interoperability requires at least2CPU/512MiB half-host budget' unless quota >= 2 && memory >= 512 * 1024**2
+per_memory = memory / 2 / 4096 * 4096
+per_cpu = quota / 2.0
+device = File.stat(options.fetch('io-device'))
+abort 'I/O device must be a block device' unless device.blockdev?
+expected_limits = { 'cpu.max' => "#{(per_cpu * 100000).to_i} 100000", 'memory.max' => per_memory.to_s, 'memory.swap.max' => '0', 'pids.max' => '128',
+  'io.max' => "#{device.rdev_major}:#{device.rdev_minor} rbps=4194304 wbps=1048576 riops=max wiops=max" }
+check = lambda do
+  owned_memory = active.values.sum { |record| File.read('/sys/fs/cgroup' + record.fetch(:group) + '/memory.current').to_i }
+  owned_resident = active.values.sum do |record|
+    stats = File.readlines('/sys/fs/cgroup' + record.fetch(:group) + '/memory.stat').to_h { |line| key, value = line.split; [key, value.to_i] }
+    %w[anon kernel_stack pagetables sock percpu slab_unreclaimable].sum { |key| stats.fetch(key, 0) }
+  end
+  active.each do |name, record|
+    inspected = JSON.parse(run.call('docker', 'inspect', name).first).first
+    raise 'Interoperability container identity changed' unless inspected.fetch('Id') == record.fetch(:id)
+    group = File.read("/proc/#{inspected.fetch('State').fetch('Pid')}/cgroup").split('0::').last.strip
+    raise 'Interoperability scope changed' unless group == record.fetch(:group)
+    path = '/sys/fs/cgroup' + group
+    raise 'Interoperability caps differ' unless expected_limits.all? { |key, value| File.read(path + '/' + key).strip == value }
+    actual_cpus = File.read(path + '/cpuset.cpus.effective').strip.split(',').flat_map { |part| first, last = part.split('-').map(&:to_i); last ? (first..last).to_a : [first] }
+    raise 'Interoperability affinity differs' unless actual_cpus == affinity.split(',').map(&:to_i)
+    events = File.readlines(path + '/memory.events').to_h { |line| line.split }
+    raise 'Interoperability OOM or swap' unless events.values_at('oom', 'oom_kill') == %w[0 0] && File.read(path + '/memory.swap.current').to_i.zero?
+    parent = File.dirname(path)
+    loop do
+      raise 'Interoperability hierarchy escaped' unless parent == '/sys/fs/cgroup' || parent.start_with?('/sys/fs/cgroup/')
+      if File.file?(parent + '/cpu.max')
+        maximum, period = File.read(parent + '/cpu.max').split
+        raise 'Interoperability CPU ancestor too small' unless maximum == 'max' || Integer(maximum) >= 2 * quota * Integer(period)
+      end
+      maximum = File.file?(parent + '/memory.max') ? File.read(parent + '/memory.max').strip : 'max'
+      headroom = maximum == 'max' ? File.read('/proc/meminfo')[/^MemAvailable:\s+(\d+)/, 1].to_i * 1024 + owned_resident : Integer(maximum) - File.read(parent + '/memory.current').to_i + owned_memory
+      raise 'Interoperability memory ancestor too small' if headroom < 2 * memory
+      break if parent == '/sys/fs/cgroup'
+      parent = File.dirname(parent)
+    end
+  end
+end
+nonce = 'skvoz-client-interop-' + SecureRandom.hex(6)
+volume = nonce + '-state'
+server = nonce + '-server'; client = nonce + '-client'; setup = nonce + '-setup'
+flags = ['--rm', '--user', '10001:10001', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--read-only', '--cgroupns', 'private',
+  '--cpus', per_cpu.to_s, '--cpuset-cpus', affinity, '--memory', per_memory.to_s, '--memory-swap', per_memory.to_s, '--pids-limit', '128',
+  '--device-read-bps', options.fetch('io-device') + ':4mb', '--device-write-bps', options.fetch('io-device') + ':1mb',
+  '--ulimit', 'core=0', '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=134217728,mode=1777']
+attempted = []
+launch = lambda do |name, *argv|
+  attempted << name
+  run.call('docker', 'run', '-d', '--name', name, *flags, *argv)
+  inspected = JSON.parse(run.call('docker', 'inspect', name).first).first
+  group = File.read("/proc/#{inspected.fetch('State').fetch('Pid')}/cgroup").split('0::').last.strip
+  raise 'Docker capped ancestor missing' unless [inspected.fetch('Id'), 'docker-' + inspected.fetch('Id') + '.scope'].include?(File.basename(group))
+  active[name] = owned[name] = { id: inspected.fetch('Id'), group: group }
+  check.call
+end
+socket_info = 's=File.lstat(ARGV[0]);abort unless s.socket? && s.uid==10001 && s.mode&0777==0600;puts [s.dev,s.ino,s.uid,s.mode&0777].join(":")'
+reservations = 5.times.map { TCPServer.new('127.0.0.1', 0) }
+broker, monitor, *targets = reservations.map { |socket| socket.local_address.ip_port }
+created_volume = false
+handlers = %w[TERM INT HUP].to_h { |signal| [signal, Signal.trap(signal) { raise Interrupt, 'Interoperability interrupted' }] }
+begin
+  run.call('docker', 'image', 'load', '--input', options.fetch('archive'), timeout: 120)
+  image = JSON.parse(run.call('docker', 'image', 'inspect', server_image).first).first
+  labels = image.dig('Config', 'Labels') || {}
+  raise 'Loaded Server image identity differs' unless image.fetch('Id') == server_image && image.values_at('Os', 'Architecture') == %w[linux amd64] &&
+    labels['org.opencontainers.image.source'] == expected.dig('source', 'repository') && labels['org.opencontainers.image.version'] == '8.0.1' && labels['org.opencontainers.image.revision'] == expected.dig('source', 'revision')
+  run.call('docker', 'image', 'inspect', client_image)
+  created_volume = true
+  run.call('docker', 'volume', 'create', volume)
+  launch.call(setup, '--network', 'none', '--mount', "type=volume,src=#{volume},dst=/var/lib/skvoz", '--entrypoint', 'sleep', server_image, options[:deadline].to_s)
+  config = { v: 5, state_dir: '/var/lib/skvoz', address: 'localhost', bind: '127.0.0.1', port: broker, monitor_port: monitor, network: {},
+    allow: %w[127.0.0.1/32 ::1/128].map { |cidr| { cidr: cidr, protocols: [6], ports: targets } }, tls: { mode: 'local' } }
+  run.call('docker', 'exec', '-i', setup, 'sh', '-ec', 'umask 077; cat > /var/lib/skvoz/server.json', input: JSON.generate(config), watch: check)
+  run.call('docker', 'rm', '-f', setup); active.delete(setup)
+  reservations.shift(2).each(&:close)
+  launch.call(server, '--network', 'host', '--mount', "type=volume,src=#{volume},dst=/var/lib/skvoz", server_image, 'serve', '--config', '/var/lib/skvoz/server.json')
+  ready_by = [work_deadline, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 70].min
+  loop do
+    out, status = run.call('docker', 'exec', server, 'skvoz-server', 'health', '--state', '/var/lib/skvoz', expect: nil, watch: check)
+    break if status.zero? && JSON.parse(out)['healthy'] == true
+    raise 'Server readiness deadline exceeded' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= ready_by
+    sleep 0.5
+  end
+  bundle = JSON.parse(run.call('docker', 'exec', server, 'skvoz-server', 'user', 'add', 'service_interop', '--state', '/var/lib/skvoz', watch: check).first)
+  mount = JSON.parse(run.call('docker', 'volume', 'inspect', volume).first).first
+  raise 'Unexpected state volume mountpoint' unless mount.fetch('Name') == volume && mount.fetch('Driver') == 'local' && mount.fetch('Mountpoint').start_with?('/')
+  socket_path = mount.fetch('Mountpoint') + '/admin.sock'
+  before = run.call('docker', 'exec', server, 'ruby', '-e', socket_info, '/var/lib/skvoz/admin.sock', watch: check).first.strip
+  launch.call(client, '--network', 'host', '--mount', "type=bind,src=#{socket_path},dst=/server-admin.sock,readonly",
+    '--tmpfs', '/profile:rw,noexec,nosuid,nodev,size=131072,mode=0700,uid=10001,gid=10001', '--tmpfs', '/native:rw,exec,nosuid,nodev,size=134217728,mode=0700,uid=10001,gid=10001',
+    '--env', 'SKVOZ_INTEGRATION=1', '--env', 'SKVOZ_SERVER_TEST_PROFILE=/profile/context.json', '--env', 'SKVOZ_TEST_RUNTIME=/native/install/bin/skvoz-network-runtime',
+    '--entrypoint', 'sleep', client_image, options[:deadline].to_s)
+  raise 'Mounted admin socket inode differs' unless run.call('docker', 'exec', client, 'ruby', '-e', socket_info, '/server-admin.sock', watch: check).first.strip == before
+  profile = { bundle: bundle, admin_socket: '/server-admin.sock', target_ports: targets }
+  run.call('docker', 'exec', '-i', client, 'sh', '-ec', 'umask 077; cat > /profile/context.json', input: JSON.generate(profile), watch: check)
+  run.call('docker', 'exec', '-i', client, 'sh', '-ec', 'umask 077; cat > /native/network.lock.json', input: File.binread(network_lock), watch: check)
+  File.open(network_archive, 'rb') do |input|
+    run.call('docker', 'exec', '-i', client, 'sh', '-ec', 'umask 077; cat > /native/network.tar.gz', input: input, watch: check)
+  end
+  run.call('docker', 'exec', client, 'ruby', 'bin/install-native', '/native/network.lock.json', '/native/install', '/native/network.tar.gz', watch: check)
+  reservations.each(&:close)
+  output = run.call('docker', 'exec', client, 'bundle', 'exec', 'rspec', 'spec/native_spec.rb', watch: check, timeout: 190).first
+  raise 'Admin socket inode changed during interoperability' unless run.call('docker', 'exec', server, 'ruby', '-e', socket_info, '/var/lib/skvoz/admin.sock', watch: check).first.strip == before
+  puts output
+ensure
+  %w[TERM INT HUP].each { |signal| Signal.trap(signal, 'IGNORE') }
+  reservations.each { |socket| socket.close unless socket.closed? }
+  cleanup_errors = []
+  attempted.reverse_each do |name|
+    record = owned[name]
+    begin
+      run.call('docker', 'rm', '-f', name, deadline: final_deadline, expect: nil, timeout: 5)
+      [name, record&.fetch(:id)].compact.each do |identity|
+        out, status, error = run.call('docker', 'container', 'inspect', '--format', '{{.Id}}', identity, deadline: final_deadline, expect: nil, timeout: 5)
+        raise 'Interoperability container remains' unless status == 1 && out.strip.empty? && error.strip == 'Error response from daemon: No such container: ' + identity
+      end
+      raise 'Interoperability scope remains' if record && File.exist?('/sys/fs/cgroup' + record.fetch(:group))
+    rescue StandardError => error
+      cleanup_errors << error.message
+    end
+  end
+  if created_volume
+    begin
+      run.call('docker', 'volume', 'rm', volume, deadline: final_deadline, timeout: 5)
+      out, status, error = run.call('docker', 'volume', 'inspect', volume, deadline: final_deadline, expect: nil, timeout: 5)
+      raise 'Interoperability volume remains' unless status == 1 && error.include?('no such volume')
+    rescue StandardError => error
+      cleanup_errors << error.message
+    end
+  end
+  handlers.each { |signal, handler| Signal.trap(signal, handler) }
+  raise 'Interoperability cleanup incomplete: ' + cleanup_errors.join('; ') unless cleanup_errors.empty?
+end

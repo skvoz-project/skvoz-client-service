@@ -1,0 +1,13 @@
+.bundle/
+vendor/bundle/
+artifacts/native/
+*.log
+*.tmp
+AGENTS.md
+**/.knowledge/
+.agents/
+.codex/
+.aws/
+.idea/
+**/temp/
+test-support/providers/

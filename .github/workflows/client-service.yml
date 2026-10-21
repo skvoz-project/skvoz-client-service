@@ -1,0 +1,50 @@
+name: Client Service
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: client-service-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build component test image
+        run: ruby bin/build-image --target tests --tag-prefix skvoz-client:ci
+      - name: Ruby host and importer contracts
+        run: |
+          name=skvoz-client-ruby-${{ github.run_id }}-${{ github.run_attempt }}
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          timeout --kill-after=20s 600s docker run --rm --init --name "$name" --user "$(id -u):$(id -g)" \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint sh skvoz-client:ci-tests -ec 'exec bundle exec rspec spec'
+      - name: Fetch the pinned Network release bundle
+        run: |
+          mkdir -p artifacts/native
+          if [ ! -f artifacts/native/network-current-identity.tar.gz ]; then
+            name=skvoz-client-fetch-${{ github.run_id }}-${{ github.run_attempt }}
+            trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+            timeout --kill-after=20s 240s docker run --rm --name "$name" --user "$(id -u):$(id -g)" \
+              --cap-drop ALL --security-opt no-new-privileges:true \
+              --mount type=bind,src="$PWD",dst=/consumer,readonly \
+              --mount type=bind,src="$PWD/artifacts/native",dst=/native \
+              --workdir /consumer --entrypoint ruby skvoz-client:ci-tests \
+              bin/fetch-native artifacts/network.lock.json /native/network-current-identity.tar.gz
+          fi
+      - name: Package ready native bundle
+        run: ruby bin/build-image --target deploy --tag-prefix skvoz-client:ci
+      - name: Host and native runtime versions
+        run: |
+          name=skvoz-client-versions-${{ github.run_id }}-${{ github.run_attempt }}
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          timeout --kill-after=20s 60s docker run --rm --name "$name" --user "$(id -u):$(id -g)" \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --entrypoint sh skvoz-client:ci-deploy -ec '
+              skvoz-client --version
+              exec /usr/local/bin/skvoz-network-runtime --version'
