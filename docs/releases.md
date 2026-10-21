@@ -1,9 +1,41 @@
-# Готовые зависимости из GitHub Releases
+# Поставка образа и готовые зависимости
 
-Обычная цепочка: Network Actions публикует Linux bundle → Client Service
-закрепляет точный release → собственные Actions получают bundle и упаковывают
-Docker image. Core входит в Network bundle. Server не нужен для host checks,
-native packaging и ordinary Client Service CI.
+Обычная цепочка: Network Actions публикует Linux bundle в Releases → Client Service
+закрепляет точный release → собственные Actions получают bundle, упаковывают и
+публикуют готовый Docker image в GHCR. Core входит в Network bundle.
+Server не нужен для host checks, native packaging и ordinary Client Service CI.
+
+## Получение готового образа
+
+После успешных проверок push или ручного запуска из `main` отдельный job
+публикует тот же проверенный образ в `ghcr.io/skvoz-project/skvoz-client-service`:
+
+- `latest` — последняя успешно опубликованная сборка `main`;
+- `sha-<полный40SHA>` — образ выбранного исходного commit.
+
+```sh
+docker pull ghcr.io/skvoz-project/skvoz-client-service:latest
+docker compose up -d
+```
+
+Перед запуском сохраните [Compose-файл](../compose.yaml) и задайте `server`,
+`username`, `password`, как описано в [быстром запуске](container-client.md#быстрый-запуск).
+Compose использует этот GHCR image и `pull_policy: missing`. Ruby, Core/Network
+исходники и локальная сборка не требуются. Для фиксации точного содержимого
+укажите в `image` registry digest
+`ghcr.io/skvoz-project/skvoz-client-service@sha256:<digest>`.
+
+Publisher получает проверенный gzip-архив Docker и `SHA256SUMS` из Actions
+artifact, сверяет checksum, выполняет `docker load` и `docker push` без повторной
+сборки. Архив используется для передачи между jobs; обычная поставка пользователю
+идёт через GHCR. Pull request и другие ветки не публикуют образ.
+Вход выполняется штатным `GITHUB_TOKEN` с `packages: write`, отдельный PAT для
+workflow не нужен. Метка `org.opencontainers.image.source` связывает пакет
+с репозиторием клиента.
+
+При первой публикации GHCR создаёт пакет Private. Для анонимного `docker pull`
+выберите Public в настройках пакета, как описано в
+[документации GitHub](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
 
 ## Обновление Network
 
@@ -32,7 +64,8 @@ runtime/helper/Core, ресурсы, лицензии и исходный manife
 [Workflow](../.github/workflows/client-service.yml) выполняет собственные host и
 проверки получения зависимости, получает точный Network archive, собирает deploy и проверяет
 версии host/runtime. Он не получает Server fixture/source archive, не требует
-Server release и не публикует Docker image. Неверный или отсутствующий native
+образа Server. После проверок образ сохраняется как Actions artifact; из
+`main` отдельный job публикует его в GHCR. Неверный или отсутствующий native
 asset завершает упаковку ошибкой без source rebuild fallback.
 
 [Отдельная opt-in проверка](../test-support/README.md) использует готовый Server

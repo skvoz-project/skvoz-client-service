@@ -4,6 +4,11 @@
 текущая реализация работает без UI на Linux/amd64. Ruby host управляет
 конфигурацией, identity и адаптерами, готовый Network runtime использует общий Core.
 
+После успешной сборки `main` GitHub Actions публикует готовый Docker-образ в
+`ghcr.io/skvoz-project/skvoz-client-service` с тегами `latest` и `sha-<полный commit>`.
+Начните с [загрузки и запуска образа](docs/releases.md#получение-готового-образа).
+Для этого не нужны Ruby или локальная сборка.
+
 Выберите ВПН для контейнеров в общем network namespace либо Прокси:
 HTTP/CONNECT/SOCKS5, именованные TCP forwards и HTTP base-URL gateways.
 
@@ -13,8 +18,8 @@ Server и его release для них не нужны. [Обновление з
 Сборка проверяет SHA256 закреплённого архива и распаковывает необходимые файлы
 стандартным `tar`. Дополнительный установщик не требуется.
 
-Начните с [руководства](docs/container-client.md) и
-[Compose-файла](compose.yaml). Три поля подключения находятся в inline YAML;
+Настройка клиента описана в [руководстве](docs/container-client.md) и
+[Compose-файле](compose.yaml). Три поля подключения находятся в inline YAML;
 обязательных внешних env/config файлов нет.
 
 Для компонентных проверок из корня репозитория:
@@ -42,5 +47,5 @@ Core или Network из исходников. [Отдельная сквозн�
 подключения; `health` проверяет текущий процесс и heartbeat; `--version` показывает
 версии компонента и протоколов. Private named volume сохраняет одну device identity.
 
-Версия Ruby client — 1.0.1. Совместимый runtime tuple:
+Версия Ruby client — 2.0.0. Совместимый runtime tuple:
 Network0.7.0/API1/network protocol6/Core5.0.0. Лицензия — [MIT](LICENSE).

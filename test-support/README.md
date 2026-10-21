@@ -40,24 +40,24 @@ Server restart/setup/cleanup остаются ответственностью h
 ## Воспроизводимый host запуск
 
 Соберите собственный `tests` image [обычной командой](../docs/build.md) и закрепите
-его реальный image ID. Получите готовые archive и `server-image.json` из явно
-выбранного Server release и закрепите SHA256 обоих файлов по `SHA256SUMS`.
+его реальный image ID. Для Server выберите опубликованный в GHCR образ и
+закрепите registry digest в `SERVER_IMAGE`, например
+`ghcr.io/skvoz-project/skvoz-server@sha256:<64 lowercase hexadecimal digits>`.
 Потребуются Ruby4.0.7/Bundler4.0.22 с собственными gems, Docker, полная host
 cgroupv2 hierarchy и готовый Network archive, совпадающий с owning lock.
 
 ```sh
 bundle exec ruby bin/check-interoperability \
-  --server-release "$SERVER_RELEASE_TAG" \
-  --archive "$SERVER_ARCHIVE" --archive-sha256 "$SERVER_ARCHIVE_SHA256" \
-  --receipt "$SERVER_IMAGE_RECEIPT" --receipt-sha256 "$SERVER_RECEIPT_SHA256" \
+  --server-image "$SERVER_IMAGE" \
   --client-image "$CLIENT_TEST_IMAGE_ID" \
   --network-archive artifacts/native/network-current-identity.tar.gz \
   --io-device <local-block-device>
 ```
 
-Tag содержит полный реальный40SHA. Команда сверяет оба digest и точный receipt
-с image ID/source/version/tag до `docker image load`, затем Linux/amd64 и labels.
-Mutable image tags и предполагаемый будущий Server pin не принимаются.
+Команда принимает только owning GHCR Server image с точным `@sha256:` и
+выполняет `docker image pull --platform linux/amd64`, затем проверяет платформу.
+При ошибке pull контейнеры и state volume не создаются. Архив/receipt Server
+не нужны; mutable tags и сборка Server из исходников не используются.
 Она сама резервирует пять разных портов, создаёт unique state volume,
 подготавливает0600 config через непривилегированный контейнер, запускает Server,
 ждёт `health` и получает bundle через штатный `user add`. Socket берётся только
@@ -73,7 +73,7 @@ cleanup, удаляет только свои контейнеры и state volu
 Для локальной квалификации дополнительно используется внешний sticky kernel
 guard до финального cleanup. Готовые пользовательские images команда не удаляет.
 
-Выбранные Server product release и Network bundle должны реально существовать
+Выбранные Server image в GHCR и Network bundle должны реально существовать
 до этого публичного маршрута; до публикации pins не придумываются.
 Обычные component tests/CI доступны независимо от него.
 
@@ -92,7 +92,7 @@ HTTP binary body, сохранение device identity после рестарт
 сценарию и закрываются в ensure; общий deadline180s, отдельные CLI/I/O/setup waits
 конечны. Controller всегда удаляет свой Server и private metadata даже при ошибке.
 
-Готовый Server release и private profile задаются явно; новый tag/digest не
-выбирается автоматически. Отсутствие публичного Server product release ограничивает
+Готовый Server image по digest и private profile задаются явно; новый digest не
+выбирается автоматически. Отсутствие выбранного Server image ограничивает
 этот opt-in маршрут, но не ordinary CI. Результат относится к выбранным image/
 bundle; Compose/shared-netns/TUN и другие платформы требуют отдельной квалификации.

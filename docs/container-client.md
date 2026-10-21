@@ -1,6 +1,6 @@
 # Контейнерный клиент
 
-`skvoz-client` 1.0.1 — Linux/amd64 клиентский сервис без UI на Ruby 4.0.7, использующий
+`skvoz-client` 2.0.0 — Linux/amd64 клиентский сервис без UI на Ruby 4.0.7, использующий
 тот же Rust Core/network, что Ubuntu, Android и сервер. Он подключается по обычным
 адресу `DNS:port`, `IP:port` или `[IPv6]:port`, логину и паролю пользователя.
 Полный сервер может быть доступен напрямую или через поддерживаемый стандартный
@@ -16,8 +16,11 @@ docker compose up -d
 docker compose logs client
 ```
 
-Compose использует локальный образ `skvoz-client:local-deploy`. Сначала выполните
-[упаковку готового native bundle](#сборка-и-зависимости). CLI имеет команды
+Compose получает `ghcr.io/skvoz-project/skvoz-client-service:latest`.
+Для обычного запуска достаточно `docker compose pull client` и `docker compose up -d`;
+[теги и условия загрузки](releases.md#получение-готового-образа) описаны отдельно.
+Для собственной сборки доступна [упаковка готового native bundle](#сборка-и-зависимости).
+CLI имеет команды
 `serve`, `check`, `health`, `--version`. `check` проверяет YAML без подключения;
 `health` возвращает JSON и код 0 только для текущего живого готового процесса.
 
@@ -82,7 +85,8 @@ streaming — разрыв. Отмена потребителя закрывае
 ```yaml
 services:
   client:
-    image: skvoz-client:local-deploy
+    image: ghcr.io/skvoz-project/skvoz-client-service:latest
+    pull_policy: missing
     restart: unless-stopped
     environment:
       SKVOZ_CLIENT_CONFIG: |
@@ -182,8 +186,8 @@ blocked I/O progress 30s; idle SSE разрешён. Завершение огр
 
 ## Сборка и зависимости
 
-Обычный поток использует GitHub Actions/Releases поставщиков: после публикации
-Для сборки нужен только готовый Linux Network bundle; Core входит в него.
+При сборке из исходников зависимость приходит из GitHub Actions/Releases
+поставщика: нужен готовый Linux Network bundle; Core входит в него.
 Server не является prerequisite упаковки. `artifacts/network.lock.json` закрепляет
 точный release URL/SHA256, target/profile и tuple runtime/API/protocol/Core/helper/
 native ABI. [Команда обновления](releases.md) выбирает только явно заданный
@@ -196,6 +200,9 @@ mkdir -p artifacts/native
 bundle exec ruby bin/fetch-native artifacts/network.lock.json artifacts/native/network-current-identity.tar.gz
 ruby bin/build-image --target deploy --tag-prefix skvoz-client:local
 ```
+
+Для использования локальной сборки замените в Compose `image` на
+`skvoz-client:local-deploy` и `pull_policy` на `never`.
 
 Dockerfile вызывает собственную короткую команду получения native dependency:
 проверяет закреплённый SHA256 архива, затем стандартным `tar` извлекает необходимые
@@ -215,7 +222,8 @@ Runtime разрешает соседний `lib/libskvoz_core.so` без
 
 Docker `tests` target содержит RSpec и проверяет собственный host и получение зависимости без
 native bundle и Server; `deploy` устанавливает production gems по Gemfile.lock.
-Обычный CI не требует Server release. Полезный [сквозной сценарий](../test-support/README.md)
+Обычный CI не требует образа Server. Полезный [сквозной сценарий](../test-support/README.md)
 запускается отдельно на готовом Server product через его публичный admin interface.
-Host/archive проверки не доказывают native/TUN или сквозную работу. Автоматическая
-публикация Docker image не включена.
+Host/archive проверки не доказывают native/TUN или сквозную работу.
+Готовый Docker image публикуется в GHCR отдельным job из `main`, как описано в
+[руководстве поставки](releases.md#получение-готового-образа).

@@ -13,6 +13,8 @@ jobs:
   qualify:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      version: ${{ steps.export.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build component test image
@@ -48,3 +50,59 @@ jobs:
             --entrypoint sh skvoz-client:ci-deploy -ec '
               skvoz-client --version
               exec /usr/local/bin/skvoz-network-runtime --version'
+      - name: Export the qualified product image
+        id: export
+        shell: bash
+        run: |
+          version=$(ruby -e "puts File.read('lib/skvoz/client.rb')[/^\s*VERSION = '(\d+\.\d+\.\d+)'$/, 1]")
+          test -n "$version"
+          output="$RUNNER_TEMP/client-service-image"
+          archive="skvoz-client-service-$version-x86_64-unknown-linux-gnu.docker.tar.gz"
+          mkdir -p "$output"
+          docker tag skvoz-client:ci-deploy "skvoz-client:$version"
+          docker save "skvoz-client:$version" | gzip -n > "$output/$archive"
+          (cd "$output" && sha256sum "$archive" > SHA256SUMS)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: client-service-image-${{ github.sha }}
+          path: ${{ runner.temp }}/client-service-image/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish-image:
+    needs: qualify
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    env:
+      CLIENT_VERSION: ${{ needs.qualify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-service-image-${{ github.sha }}
+          path: ${{ runner.temp }}/client-service-image/
+      - name: Load the qualified client image
+        shell: bash
+        working-directory: ${{ runner.temp }}/client-service-image/
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          archive="skvoz-client-service-$CLIENT_VERSION-x86_64-unknown-linux-gnu.docker.tar.gz"
+          docker load --input "$archive"
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the qualified client image to GHCR
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "skvoz-client:$CLIENT_VERSION" "$image:sha-$GITHUB_SHA"
+          docker push "$image:sha-$GITHUB_SHA"
+          docker tag "skvoz-client:$CLIENT_VERSION" "$image:latest"
+          docker push "$image:latest"

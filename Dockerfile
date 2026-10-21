@@ -41,6 +41,7 @@ COPY ${NETWORK_ARCHIVE} /native/bundle.tar.gz
 RUN bundle exec ruby bin/install-native /native/lock.json /opt/skvoz-native /native/bundle.tar.gz
 
 FROM runtime-base AS deploy
+LABEL org.opencontainers.image.source="https://github.com/skvoz-project/skvoz-client-service"
 COPY --from=gems /usr/local/bundle /usr/local/bundle
 COPY --from=native /opt/skvoz-native/bin/skvoz-network-runtime /opt/skvoz-native/bin/skvoz-network-helper /opt/skvoz-native/bin/
 COPY --from=native /opt/skvoz-native/lib /opt/skvoz-native/lib

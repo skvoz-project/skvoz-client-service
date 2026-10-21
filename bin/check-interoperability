@@ -12,31 +12,19 @@ require 'timeout'
 
 options = { deadline: 300 }
 OptionParser.new do |parser|
-  parser.banner = 'Usage: bundle exec ruby bin/check-interoperability --server-release TAG --archive PATH --archive-sha256 SHA --receipt PATH --receipt-sha256 SHA --client-image sha256:ID --network-archive PATH --io-device DEVICE'
-  %w[server-release archive archive-sha256 receipt receipt-sha256 client-image network-archive io-device].each do |name|
+  parser.banner = 'Usage: bundle exec ruby bin/check-interoperability --server-image ghcr.io/skvoz-project/skvoz-server@sha256:DIGEST --client-image sha256:ID --network-archive PATH --io-device DEVICE'
+  %w[server-image client-image network-archive io-device].each do |name|
     parser.on('--' + name + ' VALUE') { |value| options[name] = value }
   end
   parser.on('--deadline SECONDS', Integer) { |value| options[:deadline] = value }
 end.parse!
-required = %w[server-release archive archive-sha256 receipt receipt-sha256 client-image network-archive io-device]
+required = %w[server-image client-image network-archive io-device]
 abort 'All pinned artifact options are required' unless required.all? { |key| options[key] }
 abort 'Deadline must be240..600 seconds' unless options[:deadline].between?(240, 600)
-tag = options.fetch('server-release')
-abort 'An exact Server product release is required' unless tag.match?(/\Aserver-v8\.0\.1-[0-9a-f]{40}\z/)
-%w[archive receipt].each do |kind|
-  path = options.fetch(kind)
-  sha = options.fetch(kind + '-sha256')
-  stat = File.lstat(path)
-  abort 'Invalid pinned Server artifact' unless stat.file? && stat.size.positive? && stat.size <= (kind == 'receipt' ? 65_536 : 1024**3) &&
-    sha.match?(/\A[0-9a-f]{64}\z/) && Digest::SHA256.file(path).hexdigest == sha
-end
-receipt = JSON.parse(File.binread(options.fetch('receipt')), max_nesting: 8, allow_duplicate_key: false)
-expected = { 'schema' => 1, 'component' => 'skvoz-server', 'version' => '8.0.1', 'target' => 'x86_64-unknown-linux-gnu',
-  'source' => { 'repository' => 'https://github.com/skvoz-project/skvoz-server', 'revision' => tag.split('-').last }, 'tag' => tag }
-abort 'Server product receipt differs' unless receipt.keys.sort == (expected.keys + ['image_id']).sort && expected.all? { |key, value| receipt[key] == value }
-server_image = receipt.fetch('image_id')
+server_image = options.fetch('server-image')
+abort 'An owning Server image pinned by digest is required' unless server_image.match?(%r{\Aghcr\.io/skvoz-project/skvoz-server@sha256:[0-9a-f]{64}\z})
 client_image = options.fetch('client-image')
-abort 'Exact image IDs are required' unless [server_image, client_image].all? { |id| id.match?(/\Asha256:[0-9a-f]{64}\z/) }
+abort 'An exact client image ID is required' unless client_image.match?(/\Asha256:[0-9a-f]{64}\z/)
 network_archive = File.expand_path(options.fetch('network-archive'))
 network_lock = File.expand_path('../artifacts/network.lock.json', __dir__)
 abort 'Network archive digest differs from the owning pin' unless File.lstat(network_archive).file? && File.size(network_archive).between?(1, 256 * 1024**2) &&
@@ -147,11 +135,9 @@ broker, monitor, *targets = reservations.map { |socket| socket.local_address.ip_
 created_volume = false
 handlers = %w[TERM INT HUP].to_h { |signal| [signal, Signal.trap(signal) { raise Interrupt, 'Interoperability interrupted' }] }
 begin
-  run.call('docker', 'image', 'load', '--input', options.fetch('archive'), timeout: 120)
+  run.call('docker', 'image', 'pull', '--platform', 'linux/amd64', '--quiet', server_image, timeout: 120)
   image = JSON.parse(run.call('docker', 'image', 'inspect', server_image).first).first
-  labels = image.dig('Config', 'Labels') || {}
-  raise 'Loaded Server image identity differs' unless image.fetch('Id') == server_image && image.values_at('Os', 'Architecture') == %w[linux amd64] &&
-    labels['org.opencontainers.image.source'] == expected.dig('source', 'repository') && labels['org.opencontainers.image.version'] == '8.0.1' && labels['org.opencontainers.image.revision'] == expected.dig('source', 'revision')
+  raise 'Server image platform differs' unless image.values_at('Os', 'Architecture') == %w[linux amd64]
   run.call('docker', 'image', 'inspect', client_image)
   created_volume = true
   run.call('docker', 'volume', 'create', volume)

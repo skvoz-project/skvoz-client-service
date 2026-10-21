@@ -19,6 +19,16 @@ Workflow собирает test image, выполняет собственные 
 Network bundle, собирает deploy и проверяет версии host/runtime. `deploy` требует
 [скачанный архив](container-client.md#сборка-и-зависимости). Результаты —
 `skvoz-client:ci-tests` и `skvoz-client:ci-deploy`; Compose использует deploy image.
+После проверок тот же deploy image получает тег `skvoz-client:<версия>` и
+экспортируется в gzip-архив Docker вместе с `SHA256SUMS`. Actions сохраняет
+`client-service-image-<полный SHA>` на 7 дней для каждого успешного запуска.
+Отдельный job загружает тот же образ из архива и публикует его в
+`ghcr.io/skvoz-project/skvoz-client-service` с тегами `sha-<полный SHA>` и `latest`
+при push в `main` или ручном запуске из `main`. В pull request и других ветках
+публикации нет. Право `packages: write` получает только publish job; повторной
+сборки в нём нет. Для входа в GHCR используется штатный `GITHUB_TOKEN`,
+а метка `org.opencontainers.image.source` связывает образ с репозиторием клиента.
+Команды получения готового образа приведены в [руководстве поставки](releases.md#получение-готового-образа).
 Версии базовых образов и gems закреплены в Dockerfile и Gemfile.lock.
 GitHub использует ресурсы runner и общий job timeout; полная локальная cgroup
 иерархия, имя физического диска и локальные лимиты не являются условиями CI.
